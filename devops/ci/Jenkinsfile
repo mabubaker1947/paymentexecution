@@ -1,0 +1,230 @@
+def workspace;
+def props='';
+def branchName;
+def commit_username;
+def commit_Email;
+def imageName;
+def latestTag;
+def dockerRegistry;
+def JAVA_HOME = "/opt/tools/jdk-18";
+def MVN_HOME = "/usr/share/maven";
+pipeline{
+
+    agent {
+       kubernetes {
+      yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+     label: agent
+spec:
+  volumes:
+  - name: dind-storage
+    emptyDir: {}
+  containers:
+  - name: jnlp
+    image: 'us.icr.io/100mc-assets/jenkins/inbound-agent:latest-jdk21'
+    imagePullPolicy: IfNotPresent
+    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
+    securityContext: 
+      runAsUser: 0
+      runAsGroup: 0
+    env:
+      - name: POD_IP
+        valueFrom:
+          fieldRef:
+            fieldPath: status.podIP
+      - name: DOCKER_HOST
+        value: tcp://localhost:2375
+  - name: docker
+    image: us.icr.io/100mc-assets/docker:24.0-dind
+    securityContext:
+        privileged: true 
+    volumeMounts:
+        - name: dind-storage
+          mountPath: /var/lib/docker
+  - name: maven
+    image: us.icr.io/100mc-assets/maven:3.6.3-openjdk-11-slim
+    command:
+    - cat
+    tty: true
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      runAsUser: 0
+      runAsGroup: 0
+  - name: ansible
+    image: us.icr.io/100mc-assets/apb-base:1.0
+    command:
+    - cat
+    tty: true
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      runAsUser: 0
+      runAsGroup: 0
+  - name: sonarscanner
+    image: us.icr.io/100mc-assets/sonarsource/sonar-scanner-cli:5.0.1
+    command:
+    - cat
+    tty: true
+    imagePullPolicy: IfNotPresent
+    securityContext: # https://github.com/GoogleContainerTools/kaniko/issues/681
+      runAsUser: 0
+      runAsGroup: 0
+        """
+      }
+    }
+
+
+stages{
+    stage('Checkout Code')
+    {
+     steps {
+            script{
+                try
+                {
+                    checkout scm
+                    props = readProperties  file: """devops/deploy.properties"""
+                    workspace = pwd ()
+                    commit_username=sh(returnStdout: true, script: '''username=$(git log -1 --pretty=%ae)
+                    echo ${username%@*} ''').trim();
+                    commit_Email=sh(returnStdout: true, script: '''Email=$(git log -1 --pretty=%ae)
+                    echo $Email''').trim();
+                    echo commit_username
+                    echo commit_Email
+                } catch (e) {
+                    throwError("Checkout Code",e)
+                } catch (error) {
+                    currentBuild.result='FAILURE'
+                    echo "Error occurred in Checkout Code stage"
+                    echo """${error.getMessage()}"""
+                    throw error
+                }
+            }
+              }
+            }
+  
+
+    stage ('Build') {
+     steps {
+        container('maven') {
+          script{
+                  try	{
+                sh """
+                mvn clean install
+                """
+            } catch (e) {
+                throwError("Build",e)
+            }
+          }
+           }
+        }
+       }
+    
+
+  stage ('Unit Test Execution'){
+   steps {
+    container('maven') {
+      script{
+        try {
+            println "Unit Test Execution"
+            sh """
+            mvn test
+            """
+        }catch (e) {
+            throwError("Unit Testing",e)
+        }
+    }
+    }
+    }
+    }
+
+
+       stage('SonarQube Analysis') {
+        steps {
+          container('sonarscanner') {
+            script{
+        try {
+             withFolderProperties{
+                    def sonarUrl = """${env.sonarUrl}"""
+                    def sonarName = """${env.sonarName}"""
+                withSonarQubeEnv("""$sonarName"""){
+                    sh '''
+                            mkdir .sonar .sonar/cache .scannerwork
+                            chmod -R 777 .sonar
+                            chmod -R 777 .scannerwork
+                            export SONAR_USER_HOME=${WORKSPACE}
+                            sonar-scanner \
+                            -Dproject.settings=devops/ci/sonar-project.properties \
+                            -Dsonar.sourceEncoding=UTF-8 \
+                            -Dsonar.sources=src/main \
+                            -Dsonar.java.binaries=target/classes \
+                     -Dsonar.jacoco.reportPaths=target/jacoco.exec \
+                            -Dsonar.tests=src/test \
+                    '''
+                }
+          }
+        }catch (e) {
+            throwError("Create Package", e)
+        }
+        }
+        }
+    }
+    }
+
+
+ stage('Create Docker Image') {
+  steps {
+        container('docker') {
+            script{
+                   try {
+        withFolderProperties{
+                imageName = """${env.dockerRegistryUrl}/${env.dockerRegistry}/${props['deploy.app']}:${props['api.version']}"""
+                latestTag = """${env.dockerRegistryUrl}/${env.dockerRegistry}/${props['deploy.app']}:latest"""
+                sh """
+                    docker build -t ${imageName} -f devops/ci/Dockerfile .
+                    docker tag ${imageName} ${latestTag}
+                 """
+            }
+
+        }
+        catch (e) {
+            throwError("Create Package", e)
+        }
+    }
+     }
+    }
+    }
+ 
+
+stage('IBM CR Image Push') {
+steps {
+        container('docker') {
+                withCredentials([string(credentialsId: 'cr-token', variable: 'CLOUD_TOKEN')]){
+                        sh """
+                            echo $CLOUD_TOKEN
+                            docker login -u iamapikey -p $CLOUD_TOKEN us.icr.io
+                            echo "image push"
+                            docker push ${latestTag}
+                        """
+        }
+    }
+         }
+    }  
+     
+
+
+
+    
+
+
+
+}
+}
+def throwError(String errMsg,e)
+{
+	currentBuild.result='FAILURE'
+	echo "Error occurred in ${errMsg} stage"
+	echo """${e.getMessage()}"""
+    throw e
+}
